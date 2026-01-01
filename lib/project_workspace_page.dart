@@ -36,12 +36,28 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   final ScrollController tabScrollController = ScrollController();
   int? _draggingIndex;
   int? _hoverIndex;
+  bool showSidebar = true;
+  bool _hoverSidebarEdge = false;
+  bool _hoverTocEdge = false;
+  bool _hoverInfoboxEdge = false;
+
   double? _dragPlaceholderWidth;
   int? _committedHoverIndex;
+  Map<String, List<Article>> _groupedArticles = {};
+  List<double>? _cachedTabWidths;
+  double? _cachedTabBarWidth;
 
   final controller = WorkspaceController();
   final searchController = TextEditingController();
   String searchQuery = "";
+  @override
+  void dispose() {
+    articleScrollController.dispose();
+    tabScrollController.dispose();
+    searchController.dispose();
+    controller.dispose();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -57,7 +73,47 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
     }
   }
 
-  void _refreshUI() => setState(() {});
+  void _refreshUI() {
+    _rebuildGroupedArticles();
+    setState(() {});
+  }
+
+  void _rebuildGroupedArticles() {
+    final map = <String, List<Article>>{};
+
+    for (final a in controller.articles) {
+      if (searchQuery.isEmpty || a.title.toLowerCase().contains(searchQuery)) {
+        map.putIfAbsent(a.category, () => []).add(a);
+      }
+    }
+
+    _groupedArticles = map;
+  }
+
+  String _cleanTocTitle(String raw) {
+    String text = raw;
+
+    // markdown styles
+    text = text.replaceAllMapped(RegExp(r'\*\*(.*?)\*\*'), (m) => m.group(1)!);
+    text = text.replaceAllMapped(RegExp(r'__(.*?)__'), (m) => m.group(1)!);
+    text = text.replaceAllMapped(RegExp(r'~~(.*?)~~'), (m) => m.group(1)!);
+    text = text.replaceAllMapped(RegExp(r'_(.*?)_'), (m) => m.group(1)!);
+    text = text.replaceAllMapped(RegExp(r'`(.*?)`'), (m) => m.group(1)!);
+
+    // wiki syntax — USE LEFT SIDE (TARGET)
+    text = text.replaceAllMapped(
+      RegExp(r'\[\[(.*?)\|(.*?)\]\]'),
+      (m) => m.group(1)!, // ← IMPORTANT CHANGE
+    );
+    text = text.replaceAllMapped(RegExp(r'\[\[(.*?)\]\]'), (m) => m.group(1)!);
+    text = text.replaceAllMapped(RegExp(r'\[(.*?)\]'), (m) => m.group(1)!);
+
+    // remove stray pipes
+    text = text.replaceAll('|', '');
+
+    // normalize spacing
+    return text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
 
   /// ------------- CATEGORY DELETE -------------
   void _confirmDeleteCategory(String category) {
@@ -107,12 +163,35 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
     );
   }
 
+  List<double> _computeTabWidths(List<Article> tabs, double maxWidth) {
+    const minTabWidth = 48.0;
+    const maxTabWidth = 220.0;
+
+    double estimateTabWidth(Article a) {
+      final chars = a.title.length.clamp(4, 20);
+      return ((chars * 8) + 32).toDouble().clamp(minTabWidth, maxTabWidth);
+    }
+
+    final natural = tabs.map(estimateTabWidth).toList();
+    final total = natural.fold<double>(0, (a, b) => a + b);
+
+    final compressed = total <= maxWidth ? null : maxWidth / tabs.length;
+
+    return List<double>.generate(tabs.length, (i) {
+      if (_draggingIndex == i && _dragPlaceholderWidth != null) {
+        return _dragPlaceholderWidth!;
+      }
+      return compressed ?? natural[i];
+    });
+  }
+
   Future<void> _switchArticleSafely(Article target) async {
     headingKeys.clear();
-    final canSwitch = await controller.requestArticleSwitch(
-      target,
-      () => controller.saveArticle(widget.project.id, _refreshUI),
-    );
+    final canSwitch = await controller.requestArticleSwitch(target, () async {
+      if (controller.hasUnsavedChanges) {
+        await controller.saveArticle(widget.project.id, _refreshUI);
+      }
+    });
 
     if (canSwitch) {
       controller.selectedArticle = target;
@@ -221,30 +300,91 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   }
 
   Future<Article?> _showArticleLinkPicker() async {
+    final searchController = TextEditingController();
+    String query = "";
+
     return showDialog<Article>(
       context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: panel,
-        title: const Text(
-          "Link to article",
-          style: TextStyle(color: Colors.white),
-        ),
-        content: SizedBox(
-          width: 320,
-          height: 400,
-          child: ListView(
-            children: controller.articles.map((a) {
-              return ListTile(
-                title: Text(
-                  a.title,
-                  style: const TextStyle(color: Colors.white),
+      builder: (_) {
+        return StatefulBuilder(
+          builder: (context, setLocalState) {
+            final filteredArticles = controller.articles.where((a) {
+              if (query.isEmpty) return true;
+              return a.title.toLowerCase().contains(query);
+            }).toList();
+
+            return AlertDialog(
+              backgroundColor: panel,
+              title: const Text(
+                "Link to article",
+                style: TextStyle(color: Colors.white),
+              ),
+              content: SizedBox(
+                width: 320,
+                height: 400,
+                child: Column(
+                  children: [
+                    // 🔍 SEARCH
+                    TextField(
+                      controller: searchController,
+                      autofocus: true,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: InputDecoration(
+                        hintText: "Search article...",
+                        hintStyle: const TextStyle(color: Colors.grey),
+                        prefixIcon: const Icon(
+                          Icons.search,
+                          color: Colors.grey,
+                        ),
+                        filled: true,
+                        fillColor: ProjectWorkspacePage.card,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide.none,
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                        ),
+                      ),
+
+                      onChanged: (v) {
+                        setLocalState(() {
+                          query = v.trim().toLowerCase();
+                        });
+                      },
+                    ),
+
+                    const SizedBox(height: 12),
+
+                    Expanded(
+                      child: filteredArticles.isEmpty
+                          ? const Center(
+                              child: Text(
+                                "No articles found",
+                                style: TextStyle(color: Colors.grey),
+                              ),
+                            )
+                          : ListView.builder(
+                              itemCount: filteredArticles.length,
+                              itemBuilder: (_, i) {
+                                final a = filteredArticles[i];
+                                return ListTile(
+                                  title: Text(
+                                    a.title,
+                                    style: const TextStyle(color: Colors.white),
+                                  ),
+                                  onTap: () => Navigator.pop(context, a),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
                 ),
-                onTap: () => Navigator.pop(context, a),
-              );
-            }).toList(),
-          ),
-        ),
-      ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -307,8 +447,9 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
     }
 
     insertIndex = insertIndex.clamp(0, tabs.length);
-
     tabs.insert(insertIndex, tab);
+
+    _cachedTabWidths = null;
 
     _refreshUI();
   }
@@ -615,8 +756,8 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
               });
               controller.articles.add(article);
               controller.openTabs.add(article);
+              _cachedTabWidths = null;
               await _switchArticleSafely(article);
-
               Navigator.pop(context);
             },
             child: const Text("Create"),
@@ -659,7 +800,9 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
           ),
           ElevatedButton(
             onPressed: () async {
-              await controller.saveArticle(widget.project.id, _refreshUI);
+              if (controller.hasUnsavedChanges) {
+                await controller.saveArticle(widget.project.id, _refreshUI);
+              }
               Navigator.pop(context);
               _goDashboard();
             },
@@ -681,6 +824,8 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   void _closeTab(Article article) {
     controller.openTabs.remove(article);
 
+    _cachedTabWidths = null;
+
     if (controller.selectedArticle == article &&
         controller.openTabs.isNotEmpty) {
       final next = controller.openTabs.last;
@@ -693,12 +838,7 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   /// ------------- UI -------------
   @override
   Widget build(BuildContext context) {
-    final groupedArticles = <String, List<Article>>{};
-    for (var a in controller.articles) {
-      if (searchQuery.isEmpty || a.title.toLowerCase().contains(searchQuery)) {
-        groupedArticles.putIfAbsent(a.category, () => []).add(a);
-      }
-    }
+    final groupedArticles = _groupedArticles;
 
     final selected = controller.selectedArticle;
 
@@ -708,29 +848,155 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
         children: [
           _buildTabBar(),
           Expanded(
-            child: Row(
+            child: Stack(
               children: [
-                SizedBox(width: 260, child: _buildSidebar(groupedArticles)),
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeInOutCubic,
+                  child: Row(
+                    children: [
+                      // EXISTING ROW CONTENT — unchanged
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 300),
+                        curve: Curves.easeInOutCubic,
+                        width: showSidebar ? 260 : 0,
+                        child: ClipRect(
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            widthFactor: showSidebar ? 1 : 0,
+                            child: SizedBox(
+                              width: 260,
+                              child: _buildSidebar(groupedArticles),
+                            ),
+                          ),
+                        ),
+                      ),
 
-                showToc
-                    ? SizedBox(width: 240, child: _buildTocPanel())
-                    : const SizedBox(width: 0),
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 300),
+                        curve: Curves.easeInOutCubic,
+                        width: showToc ? 240 : 0,
+                        child: ClipRect(
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            widthFactor: showToc ? 1 : 0,
+                            child: AnimatedOpacity(
+                              duration: const Duration(milliseconds: 200),
+                              opacity: showToc ? 1 : 0,
+                              child: _buildTocPanel(),
+                            ),
+                          ),
+                        ),
+                      ),
 
-                if (selected != null)
-                  Expanded(child: _buildEditor())
-                else
-                  const Expanded(child: SizedBox()),
+                      if (selected != null)
+                        Expanded(child: _buildEditor())
+                      else
+                        const Expanded(child: SizedBox()),
 
-                if (selected != null && showInfobox)
-                  InfoboxPanel(
-                    blocks: controller.selectedArticle!.infoboxBlocks,
-                    isViewMode: controller.isViewMode,
-                    panelColor: panel,
-                    onChanged: controller.markInfoboxDirty,
-                    onOpenFlagPicker: _showFlagPickerForController,
-                  )
-                else
-                  const SizedBox(width: 0),
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 300),
+                        curve: Curves.easeInOutCubic,
+                        width: (selected != null && showInfobox) ? 320 : 0,
+                        child: ClipRect(
+                          // ⭐ prevents overflow painting
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            widthFactor: (selected != null && showInfobox)
+                                ? 1
+                                : 0,
+                            child: IgnorePointer(
+                              ignoring: !(selected != null && showInfobox),
+                              child: AnimatedOpacity(
+                                duration: const Duration(milliseconds: 200),
+                                opacity: (selected != null && showInfobox)
+                                    ? 1
+                                    : 0,
+                                child: Padding(
+                                  padding: const EdgeInsets.all(8),
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      color: panel,
+                                      borderRadius: BorderRadius.circular(14),
+                                      border: Border.all(
+                                        color: Colors.white.withOpacity(0.08),
+                                      ),
+                                    ),
+                                    clipBehavior: Clip.antiAlias,
+                                    child: selected == null
+                                        ? const SizedBox()
+                                        : InfoboxPanel(
+                                            blocks: selected.infoboxBlocks,
+                                            isViewMode: controller.isViewMode,
+                                            panelColor: panel,
+                                            onChanged:
+                                                controller.markInfoboxDirty,
+                                            onOpenFlagPicker:
+                                                _showFlagPickerForController,
+                                          ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                // LEFT EDGE — Sidebar
+                if (!showSidebar)
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: 16,
+                    child: MouseRegion(
+                      onEnter: (_) => setState(() => _hoverSidebarEdge = true),
+                      onExit: (_) => setState(() => _hoverSidebarEdge = false),
+                      child: _edgeHandle(
+                        visible: _hoverSidebarEdge,
+                        icon: Icons.chevron_right,
+                        onTap: () => setState(() => showSidebar = true),
+                      ),
+                    ),
+                  ),
+
+                // LEFT INNER EDGE — TOC
+                if (!showToc)
+                  Positioned(
+                    left: showSidebar ? 0 : 16,
+                    top: 0,
+                    bottom: 0,
+                    width: 16,
+                    child: MouseRegion(
+                      onEnter: (_) => setState(() => _hoverTocEdge = true),
+                      onExit: (_) => setState(() => _hoverTocEdge = false),
+                      child: _edgeHandle(
+                        visible: _hoverTocEdge,
+                        icon: Icons.chevron_right,
+                        onTap: () => setState(() => showToc = true),
+                      ),
+                    ),
+                  ),
+
+                // RIGHT EDGE — Infobox
+                if (!showInfobox)
+                  Positioned(
+                    right: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: 16,
+                    child: MouseRegion(
+                      onEnter: (_) => setState(() => _hoverInfoboxEdge = true),
+                      onExit: (_) => setState(() => _hoverInfoboxEdge = false),
+                      child: _edgeHandle(
+                        visible: _hoverInfoboxEdge,
+                        icon: Icons.chevron_left,
+                        onTap: () => setState(() => showInfobox = true),
+                      ),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -743,80 +1009,94 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   /// ------------- UI SECTIONS -------------
   Widget _buildTabBar() {
     return Container(
-      height: 48,
-      color: panel,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      height: 56,
+      decoration: BoxDecoration(
+        color: panel,
+        border: Border(
+          bottom: BorderSide(color: Colors.white.withOpacity(0.06)),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.25),
+            blurRadius: 8,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.home, color: Colors.white),
+            tooltip: "Dashboard",
+            icon: const Icon(Icons.home_rounded, color: Colors.white),
             onPressed: _onHomePressed,
           ),
-          const SizedBox(width: 12),
 
-          Text(
-            widget.project.name,
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.bold,
+          const SizedBox(width: 8),
+
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: ProjectWorkspacePage.card,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.white.withOpacity(0.08)),
+            ),
+            child: Text(
+              widget.project.name,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+              ),
             ),
           ),
-          const SizedBox(width: 24),
 
+          const SizedBox(width: 16),
+
+          // ───────── TABS ─────────
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final tabs = controller.openTabs;
-                if (tabs.isEmpty) return const SizedBox();
+                final count = tabs.length;
 
-                const minTabWidth = 48.0;
-                const maxTabWidth = 220.0;
+                if (count == 0) return const SizedBox();
 
-                double estimateTabWidth(Article a) {
-                  final chars = a.title.length.clamp(4, 20);
-                  return ((chars * 8) + 32).toDouble().clamp(
-                    minTabWidth,
-                    maxTabWidth,
+                // 🔒 CRITICAL: invalidate cache if length changed
+                if (_cachedTabWidths == null ||
+                    _cachedTabWidths!.length != count ||
+                    _cachedTabBarWidth != constraints.maxWidth) {
+                  _cachedTabBarWidth = constraints.maxWidth;
+                  _cachedTabWidths = _computeTabWidths(
+                    tabs,
+                    constraints.maxWidth,
                   );
                 }
 
-                final naturalWidths = tabs
-                    .map((a) => estimateTabWidth(a))
-                    .toList();
-
-                final totalNaturalWidth = naturalWidths.fold<double>(
-                  0,
-                  (a, b) => a + b,
-                );
-
-                final compressedWidth =
-                    totalNaturalWidth <= constraints.maxWidth
-                    ? null
-                    : constraints.maxWidth / tabs.length;
-
-                final widths = List<double>.generate(tabs.length, (i) {
-                  if (_draggingIndex == i && _dragPlaceholderWidth != null) {
-                    return _dragPlaceholderWidth!;
-                  }
-                  return compressedWidth ?? naturalWidths[i];
-                });
-
+                final widths = _cachedTabWidths!;
                 final positions = <double>[];
+
                 double x = 0;
-                for (var w in widths) {
+                for (final w in widths) {
                   positions.add(x);
                   x += w;
                 }
 
                 return SizedBox(
-                  height: 32,
+                  height: 44,
                   child: Stack(
-                    children: List.generate(tabs.length, (i) {
+                    clipBehavior: Clip.none,
+                    children: List.generate(count, (i) {
                       final a = tabs[i];
+                      final isActive = a == controller.selectedArticle;
+
                       double dx = positions[i];
 
-                      if (_draggingIndex != null &&
-                          _committedHoverIndex != null) {
+                      // 🔒 SAFETY: only allow drag math if >1 tab
+                      if (count > 1 &&
+                          _draggingIndex != null &&
+                          _committedHoverIndex != null &&
+                          _draggingIndex! < widths.length) {
                         if (i > _draggingIndex! && i < _committedHoverIndex!) {
                           dx -= widths[_draggingIndex!];
                         } else if (i < _draggingIndex! &&
@@ -828,52 +1108,58 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
                       return AnimatedPositioned(
                         key: ValueKey(a.id),
                         duration: const Duration(milliseconds: 180),
-                        curve: Curves.easeOut,
+                        curve: Curves.easeOutCubic,
                         left: dx,
-                        top: 0,
+                        top: isActive ? 6 : 10,
                         width: widths[i],
-                        height: 32,
+                        height: isActive ? 42 : 34,
                         child: LongPressDraggable<int>(
                           data: i,
 
-                          onDragStarted: () {
-                            setState(() {
-                              _draggingIndex = i;
-                              _dragPlaceholderWidth = widths[i];
-                            });
-                          },
+                          onDragStarted: count <= 1
+                              ? null
+                              : () {
+                                  setState(() {
+                                    _draggingIndex = i;
+                                    _dragPlaceholderWidth = widths[i];
+                                  });
+                                },
 
-                          onDragUpdate: (details) {
-                            final box = context.findRenderObject() as RenderBox;
-                            final localX = box
-                                .globalToLocal(details.globalPosition)
-                                .dx;
+                          onDragUpdate: count <= 1
+                              ? null
+                              : (details) {
+                                  final box =
+                                      context.findRenderObject() as RenderBox;
+                                  final localX = box
+                                      .globalToLocal(details.globalPosition)
+                                      .dx;
 
-                            int newIndex = tabs.length;
-                            for (int j = 0; j < positions.length; j++) {
-                              final midpoint = positions[j] + widths[j] / 2;
-                              if (localX < midpoint) {
-                                newIndex = j;
-                                break;
-                              }
-                            }
+                                  int newIndex = count;
+                                  for (int j = 0; j < positions.length; j++) {
+                                    final midpoint =
+                                        positions[j] + widths[j] / 2;
+                                    if (localX < midpoint) {
+                                      newIndex = j;
+                                      break;
+                                    }
+                                  }
 
-                            if (_committedHoverIndex != newIndex) {
-                              setState(() {
-                                _committedHoverIndex = newIndex;
-                              });
-                            }
-                          },
+                                  if (_committedHoverIndex != newIndex) {
+                                    setState(() {
+                                      _committedHoverIndex = newIndex;
+                                    });
+                                  }
+                                },
 
                           onDragEnd: (_) {
-                            if (_draggingIndex != null &&
+                            if (count > 1 &&
+                                _draggingIndex != null &&
                                 _committedHoverIndex != null) {
                               _moveTab(_draggingIndex!, _committedHoverIndex!);
                             }
 
                             setState(() {
                               _draggingIndex = null;
-                              _hoverIndex = null;
                               _committedHoverIndex = null;
                               _dragPlaceholderWidth = null;
                             });
@@ -888,7 +1174,20 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
                           ),
 
                           childWhenDragging: const SizedBox(),
-                          child: _articleTab(a, widths[i]),
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              _articleTab(a, widths[i]),
+                              if (isActive)
+                                Positioned(
+                                  left: 0,
+                                  right: 0,
+                                  bottom: -8,
+                                  height: 8,
+                                  child: Container(color: bg),
+                                ),
+                            ],
+                          ),
                         ),
                       );
                     }),
@@ -898,46 +1197,72 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
             ),
           ),
 
-          // ───────────── RIGHT CONTROLS ─────────────
+          const SizedBox(width: 8),
+
+          // ───────── RIGHT CONTROLS ─────────
           IconButton(
+            tooltip: "Sidebar",
             icon: Icon(
-              showToc ? Icons.menu_open : Icons.menu,
+              showSidebar
+                  ? Icons.space_dashboard
+                  : Icons.space_dashboard_outlined,
+              color: Colors.white,
+            ),
+            onPressed: () => setState(() => showSidebar = !showSidebar),
+          ),
+
+          IconButton(
+            tooltip: "Contents",
+            icon: Icon(
+              showToc ? Icons.toc : Icons.toc_outlined,
               color: Colors.white,
             ),
             onPressed: () => setState(() => showToc = !showToc),
           ),
+
           IconButton(
+            tooltip: "Infobox",
             icon: Icon(
-              showInfobox ? Icons.view_sidebar : Icons.view_sidebar_outlined,
+              showInfobox
+                  ? Icons.dashboard_customize
+                  : Icons.dashboard_customize_outlined,
               color: Colors.white,
             ),
             onPressed: () => setState(() => showInfobox = !showInfobox),
+          ),
+          EditorToolbar.divider(),
+
+          IconButton(
+            tooltip: "Undo",
+            icon: Icon(
+              Icons.undo_rounded,
+              color: controller.isViewMode ? Colors.grey : Colors.white,
+            ),
+            onPressed: controller.isViewMode ? null : controller.undo,
+          ),
+
+          IconButton(
+            tooltip: "Redo",
+            icon: Icon(
+              Icons.redo_rounded,
+              color: controller.isViewMode ? Colors.grey : Colors.white,
+            ),
+            onPressed: controller.isViewMode ? null : controller.redo,
           ),
 
           EditorToolbar.divider(),
 
           IconButton(
-            icon: Icon(
-              Icons.undo,
-              color: controller.isViewMode ? Colors.grey : Colors.white,
-            ),
-            onPressed: controller.isViewMode ? null : controller.undo,
-          ),
-          IconButton(
-            icon: Icon(
-              Icons.redo,
-              color: controller.isViewMode ? Colors.grey : Colors.white,
-            ),
-            onPressed: controller.isViewMode ? null : controller.redo,
-          ),
-          IconButton(
-            icon: const Icon(Icons.save, color: Colors.white),
+            tooltip: "Save",
+            icon: const Icon(Icons.save_rounded, color: Colors.white),
             onPressed: () =>
                 controller.saveArticle(widget.project.id, _refreshUI),
           ),
+
           IconButton(
+            tooltip: controller.isViewMode ? "Edit mode" : "Preview mode",
             icon: Icon(
-              controller.isViewMode ? Icons.edit : Icons.visibility,
+              controller.isViewMode ? Icons.edit_note : Icons.preview,
               color: Colors.white,
             ),
             onPressed: () =>
@@ -1036,57 +1361,172 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   }
 
   Widget _buildSidebar(Map<String, List<Article>> groupedArticles) {
-    return Container(
-      width: 260,
-      color: panel,
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        children: [
-          TextField(
-            controller: searchController,
-            style: const TextStyle(color: Colors.white),
-            onChanged: (v) =>
-                setState(() => searchQuery = v.trim().toLowerCase()),
-            decoration: InputDecoration(
-              hintText: "Search",
-              hintStyle: const TextStyle(color: grey),
-              filled: true,
-              fillColor: ProjectWorkspacePage.card,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide: BorderSide.none,
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          ElevatedButton.icon(
-            style: ProjectWorkspacePage.sidebarButtonStyle,
-            onPressed: _showNewArticleDialog,
-            icon: const Icon(Icons.add, size: 18),
-            label: const Text("New Article"),
-          ),
-          const SizedBox(height: 8),
-          ElevatedButton.icon(
-            style: ProjectWorkspacePage.sidebarButtonStyle,
-            onPressed: _showAddCategoryDialog,
-            icon: const Icon(Icons.category, size: 18),
-            label: const Text("Add Category"),
-          ),
-          const SizedBox(height: 16),
-          Expanded(
-            child: ListView(
-              children: groupedArticles.entries.expand((e) {
-                final category = e.key;
-                final items = e.value;
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: Container(
+        width: 260,
+        decoration: BoxDecoration(
+          color: panel,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white.withOpacity(0.08)),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final collapsed = constraints.maxWidth < 120;
 
-                return [
-                  _buildCategoryHeader(category),
-                  ...items.map((a) => _buildArticleTile(a)),
-                ];
-              }).toList(),
-            ),
+              return Column(
+                children: [
+                  // ───── HEADER ─────
+                  SizedBox(
+                    height: 40,
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        // If width is too small, render NOTHING
+                        if (constraints.maxWidth < 40) {
+                          return const SizedBox();
+                        }
+
+                        return Row(
+                          children: [
+                            if (constraints.maxWidth >= 120)
+                              const Expanded(
+                                child: Text(
+                                  "Articles",
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+
+                            if (constraints.maxWidth >= 40)
+                              GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () =>
+                                    setState(() => showSidebar = false),
+                                child: const SizedBox(
+                                  width: 32,
+                                  height: 32,
+                                  child: Icon(
+                                    Icons.chevron_left,
+                                    size: 20,
+                                    color: Colors.grey,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // ───── SEARCH ─────
+                  if (!collapsed)
+                    TextField(
+                      controller: searchController,
+                      style: const TextStyle(color: Colors.white),
+                      onChanged: (v) {
+                        searchQuery = v.trim().toLowerCase();
+                        _rebuildGroupedArticles();
+                        setState(() {});
+                      },
+                      decoration: InputDecoration(
+                        hintText: "Search",
+                        hintStyle: const TextStyle(color: grey),
+                        filled: true,
+                        fillColor: ProjectWorkspacePage.card,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+
+                  if (!collapsed) const SizedBox(height: 12),
+
+                  // ───── NEW ARTICLE BUTTON ─────
+                  if (!collapsed)
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        style: ProjectWorkspacePage.sidebarButtonStyle.copyWith(
+                          alignment: Alignment.centerLeft,
+                        ),
+                        onPressed: _showNewArticleDialog,
+                        child: const Row(
+                          children: [
+                            Icon(Icons.add, size: 18),
+                            SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                "New Article",
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  if (!collapsed) const SizedBox(height: 8),
+
+                  // ───── ADD CATEGORY BUTTON ─────
+                  if (!collapsed)
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        style: ProjectWorkspacePage.sidebarButtonStyle.copyWith(
+                          alignment: Alignment.centerLeft,
+                        ),
+                        onPressed: _showAddCategoryDialog,
+                        child: const Row(
+                          children: [
+                            Icon(Icons.category, size: 18),
+                            SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                "Add Category",
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  const SizedBox(height: 16),
+
+                  // ───── LIST ─────
+                  Expanded(
+                    child: collapsed
+                        ? const SizedBox()
+                        : ListView(
+                            children: groupedArticles.entries.expand((e) {
+                              final category = e.key;
+                              final items = e.value;
+
+                              return [
+                                _buildCategoryHeader(category),
+                                ...items.map(_buildArticleTile),
+                              ];
+                            }).toList(),
+                          ),
+                  ),
+                ],
+              );
+            },
           ),
-        ],
+        ),
       ),
     );
   }
@@ -1095,8 +1535,8 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
     return Padding(
       padding: const EdgeInsets.only(top: 12, bottom: 4),
       child: MouseRegion(
-        onEnter: (_) => setState(() => controller.hoveredCategory = category),
-        onExit: (_) => setState(() => controller.hoveredCategory = null),
+        onEnter: (_) => controller.hoveredCategory.value = category,
+        onExit: (_) => controller.hoveredCategory.value = null,
         child: Row(
           children: [
             Expanded(
@@ -1109,12 +1549,19 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
                 ),
               ),
             ),
-            if (controller.hoveredCategory == category &&
-                category != "Uncategorized")
-              IconButton(
-                icon: const Icon(Icons.delete, size: 14, color: grey),
-                onPressed: () => _confirmDeleteCategory(category),
-              ),
+
+            ValueListenableBuilder<String?>(
+              valueListenable: controller.hoveredCategory,
+              builder: (_, hovered, __) {
+                if (hovered != category || category == "Uncategorized") {
+                  return const SizedBox();
+                }
+                return IconButton(
+                  icon: const Icon(Icons.delete, size: 14, color: grey),
+                  onPressed: () => _confirmDeleteCategory(category),
+                );
+              },
+            ),
           ],
         ),
       ),
@@ -1124,22 +1571,34 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   Widget _buildArticleTile(Article a) {
     final isSel = a == controller.selectedArticle;
     return MouseRegion(
-      onEnter: (_) => setState(() => controller.hoveredArticle = a),
-      onExit: (_) => setState(() => controller.hoveredArticle = null),
+      onEnter: (_) => controller.hoveredArticle.value = a,
+      onExit: (_) => controller.hoveredArticle.value = null,
+
       child: ListTile(
         title: Text(
           a.title,
           style: TextStyle(color: isSel ? Colors.white : grey),
         ),
-        trailing: controller.hoveredArticle == a
-            ? IconButton(
-                icon: const Icon(Icons.delete, size: 18, color: grey),
-                onPressed: () => _confirmDeleteArticle(a),
-              )
-            : null,
+        trailing: ValueListenableBuilder<Article?>(
+          valueListenable: controller.hoveredArticle,
+          builder: (_, hovered, __) {
+            if (hovered != a) return const SizedBox();
+            return IconButton(
+              icon: const Icon(Icons.delete, size: 18, color: grey),
+              onPressed: () => _confirmDeleteArticle(a),
+            );
+          },
+        ),
+
         onTap: () async {
-          await controller.saveArticle(widget.project.id, _refreshUI);
-          if (!controller.openTabs.contains(a)) controller.openTabs.add(a);
+          if (controller.hasUnsavedChanges) {
+            await controller.saveArticle(widget.project.id, _refreshUI);
+          }
+          if (!controller.openTabs.contains(a)) {
+            controller.openTabs.add(a);
+            _cachedTabWidths = null;
+          }
+
           controller.openArticleByTitle(a.title, _refreshUI);
         },
       ),
@@ -1147,166 +1606,248 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
   }
 
   Widget _buildEditor() {
-    final a = controller.selectedArticle!;
-    return Container(
-      color: bg,
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          controller.isViewMode
-              ? Text(
-                  controller.titleController.text,
-                  softWrap: true,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 26,
-                    fontWeight: FontWeight.bold,
-                    height: 1.3,
-                  ),
-                )
-              : TextField(
-                  controller: controller.titleController,
-                  maxLines: null,
-                  minLines: 1,
-                  keyboardType: TextInputType.multiline,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 26,
-                    fontWeight: FontWeight.bold,
-                    height: 1.3,
-                  ),
-                  decoration: const InputDecoration(border: InputBorder.none),
-                ),
+    final a = controller.selectedArticle;
+    if (a == null) {
+      return const SizedBox();
+    }
 
-          if (controller.isViewMode)
-            Text(a.category, style: const TextStyle(color: grey))
-          else
-            DropdownButton<String>(
-              value: a.category,
-              dropdownColor: panel,
-              items: controller.categories
-                  .map(
-                    (c) => DropdownMenuItem(
-                      value: c,
-                      child: Text(
-                        c,
-                        style: const TextStyle(color: Colors.white),
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: Container(
+        decoration: BoxDecoration(
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.4),
+              blurRadius: 12,
+              offset: const Offset(0, 6),
+            ),
+          ],
+
+          color: bg,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: controller.isViewMode
+                ? Colors.white.withOpacity(0.08)
+                : const Color.fromARGB(255, 106, 122, 151).withOpacity(0.6),
+          ),
+        ),
+        clipBehavior: Clip.antiAlias, // IMPORTANT
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              controller.isViewMode
+                  ? Text(
+                      controller.titleController.text,
+                      softWrap: true,
+
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 26,
+                        fontWeight: FontWeight.bold,
+                        height: 1.3,
+                      ),
+                    )
+                  : TextField(
+                      controller: controller.titleController,
+                      maxLines: null,
+                      minLines: 1,
+
+                      keyboardType: TextInputType.multiline,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 26,
+                        fontWeight: FontWeight.bold,
+                        height: 1.3,
+                      ),
+                      decoration: const InputDecoration(
+                        border: InputBorder.none,
                       ),
                     ),
-                  )
-                  .toList(),
-              onChanged: (v) async {
-                if (v == null) return;
-                await (await AppDatabase.database).update(
-                  'articles',
-                  {'category': v},
-                  where: 'id = ?',
-                  whereArgs: [a.id],
-                );
-                setState(() => a.category = v);
-              },
-            ),
 
-          const SizedBox(height: 16),
+              if (controller.isViewMode)
+                Text(a.category, style: const TextStyle(color: grey))
+              else
+                DropdownButton<String>(
+                  value: a.category,
+                  dropdownColor: panel,
+                  items: controller.categories
+                      .map(
+                        (c) => DropdownMenuItem(
+                          value: c,
+                          child: Text(
+                            c,
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (v) async {
+                    if (v == null) return;
+                    await (await AppDatabase.database).update(
+                      'articles',
+                      {'category': v},
+                      where: 'id = ?',
+                      whereArgs: [a.id],
+                    );
+                    setState(() => a.category = v);
+                  },
+                ),
 
-          EditorToolbar(
-            panelColor: panel,
-            isViewMode: controller.isViewMode,
-            showToc: showToc,
-            onToggleToc: () => setState(() => showToc = !showToc),
-            onHeading: () {
-              controller.insertBlock("## ");
-            },
+              const SizedBox(height: 16),
 
-            onBold: () => controller.wrapSelection("**", "**"),
-            onItalic: () => controller.wrapSelection("_", "_"),
-            onUnderline: () => controller.wrapSelection("__", "__"),
-            onStrike: () => controller.wrapSelection("~~", "~~"),
-            onSuperscript: () => controller.wrapSelection("^", "^"),
-            onSubscript: () => controller.wrapSelection("~", "~"),
-            onAlignLeft: () => controller.insertBlock("[align:left]\n"),
-            onAlignCenter: () => controller.insertBlock("[align:center]\n"),
-            onAlignRight: () => controller.insertBlock("[align:right]\n"),
-            onAlignJustify: () => controller.insertBlock("[align:justify]\n"),
-            onLink: () async {
-              final target = await _showArticleLinkPicker();
-              if (target == null) return;
+              EditorToolbar(
+                panelColor: panel,
+                isViewMode: controller.isViewMode,
+                showToc: showToc,
+                onToggleToc: () => setState(() => showToc = !showToc),
+                onHeading: () => controller.insertBlock("## "),
+                onBold: () => controller.wrapSelection("**", "**"),
+                onItalic: () => controller.wrapSelection("_", "_"),
+                onUnderline: () => controller.wrapSelection("__", "__"),
+                onStrike: () => controller.wrapSelection("~~", "~~"),
+                onSuperscript: () => controller.wrapSelection("^", "^"),
+                onSubscript: () => controller.wrapSelection("~", "~"),
+                onAlignLeft: () => controller.insertBlock("[align:left]\n"),
+                onAlignCenter: () => controller.insertBlock("[align:center]\n"),
+                onAlignRight: () => controller.insertBlock("[align:right]\n"),
+                onAlignJustify: () =>
+                    controller.insertBlock("[align:justify]\n"),
+                onLink: () async {
+                  final target = await _showArticleLinkPicker();
+                  if (target == null) return;
+                  controller.wrapSelection("[[", "|${target.title}]]");
+                },
+                onOpenFlagMenu: () {
+                  _showFlagPickerForController(controller.contentController);
+                },
+              ),
 
-              controller.wrapSelection("[[", "|${target.title}]]");
-            },
+              const SizedBox(height: 12),
 
-            onOpenFlagMenu: () {
-              _showFlagPickerForController(controller.contentController);
-            },
+              Expanded(
+                child: controller.isViewMode
+                    ? ArticleViewer(
+                        text: controller.contentController.text,
+                        onOpenLink: (title) {
+                          final target = controller.articles
+                              .where((a) => a.title == title)
+                              .cast<Article?>()
+                              .firstOrNull;
+                          if (target != null) {
+                            _switchArticleSafely(target);
+                          }
+                        },
+                        scrollController: articleScrollController,
+                      )
+                    : ArticleEditor(
+                        controller: controller.contentController,
+                        scrollController: articleScrollController,
+                      ),
+              ),
+            ],
           ),
-
-          const SizedBox(height: 12),
-
-          Expanded(
-            child: controller.isViewMode
-                ? ArticleViewer(
-                    text: controller.contentController.text,
-                    onOpenLink: (title) {
-                      Article? target;
-                      try {
-                        target = controller.articles.firstWhere(
-                          (a) => a.title == title,
-                        );
-                      } catch (_) {
-                        target = null;
-                      }
-
-                      if (target != null) {
-                        _switchArticleSafely(target);
-                      }
-                    },
-                    scrollController: articleScrollController,
-                  )
-                : ArticleEditor(
-                    controller: controller.contentController,
-                    scrollController: articleScrollController,
-                  ),
-          ),
-        ],
+        ),
       ),
     );
   }
 
   Widget _buildTocPanel() {
-    return Container(
-      width: 220,
-      color: panel,
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            "Contents",
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 12),
-
-          Expanded(
-            child: ListView.builder(
-              itemCount: controller.tocEntries.length,
-              itemBuilder: (context, index) {
-                final entry = controller.tocEntries[index];
-
-                return InkWell(
-                  onTap: () => _scrollToHeading(entry.id),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: Text(
-                      entry.title,
-                      style: const TextStyle(color: Colors.grey, fontSize: 13),
-                    ),
-                  ),
-                );
-              },
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: Container(
+        width: 220,
+        decoration: BoxDecoration(
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.35),
+              blurRadius: 10,
+              offset: const Offset(0, 4),
             ),
+          ],
+
+          color: panel,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white.withOpacity(0.08), width: 1),
+        ),
+        clipBehavior: Clip.antiAlias, // IMPORTANT
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  // 🔒 If too narrow, render nothing (prevents overflow)
+                  if (constraints.maxWidth < 80) {
+                    return const SizedBox();
+                  }
+
+                  return Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          "Contents",
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => setState(() => showToc = false),
+                        child: const SizedBox(
+                          width: 32,
+                          height: 32,
+                          child: Icon(
+                            Icons.chevron_left,
+                            size: 20,
+                            color: Colors.grey,
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+
+              const SizedBox(height: 12),
+
+              Expanded(
+                child: ListView.builder(
+                  itemCount: controller.tocEntries.length,
+                  itemBuilder: (context, index) {
+                    final entry = controller.tocEntries[index];
+
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: () => _scrollToHeading(entry.id),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 6,
+                          horizontal: 4,
+                        ),
+                        child: Text(
+                          _cleanTocTitle(entry.title),
+                          style: const TextStyle(
+                            color: Colors.grey,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -1360,6 +1901,35 @@ class _ProjectWorkspacePageState extends State<ProjectWorkspacePage> {
 
     controller.contentController.selection = TextSelection.collapsed(
       offset: offset,
+    );
+  }
+
+  Widget _edgeHandle({
+    required bool visible,
+    required IconData icon,
+    required VoidCallback onTap,
+  }) {
+    return MouseRegion(
+      onEnter: (_) => setState(() {}),
+      onExit: (_) => setState(() {}),
+      cursor: SystemMouseCursors.click,
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 180),
+        opacity: visible ? 1.0 : 0.0,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTap: onTap,
+          child: Container(
+            width: 100,
+            height: 48,
+            decoration: BoxDecoration(
+              color: panel.withOpacity(0.85),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, size: 18, color: Colors.grey),
+          ),
+        ),
+      ),
     );
   }
 

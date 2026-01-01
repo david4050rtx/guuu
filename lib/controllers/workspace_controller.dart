@@ -27,14 +27,18 @@ class WorkspaceController {
   String originalContent = "";
   String originalTitle = "";
   String generateHeadingId() => _generateHeadingId();
-
-  Article? hoveredArticle;
-  String? hoveredCategory;
+  final ValueNotifier<Article?> hoveredArticle = ValueNotifier(null);
+  final ValueNotifier<String?> hoveredCategory = ValueNotifier(null);
 
   DateTime? lastSaved;
 
   String _generateHeadingId() {
     return "h_${DateTime.now().microsecondsSinceEpoch}";
+  }
+
+  void dispose() {
+    titleController.dispose();
+    contentController.dispose();
   }
 
   void initialize(Function refreshUI, String projectId) {

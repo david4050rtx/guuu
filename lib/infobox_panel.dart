@@ -241,8 +241,10 @@ class _InfoboxPanelState extends State<InfoboxPanel> {
           if (!widget.isViewMode && block.imagePath != null)
             Padding(
               padding: const EdgeInsets.only(top: 6),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+              child: Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 4,
+                runSpacing: 4,
                 children: [
                   _fitBtn(block, BoxFit.cover, Icons.crop),
                   _fitBtn(block, BoxFit.contain, Icons.crop_free),
@@ -250,6 +252,7 @@ class _InfoboxPanelState extends State<InfoboxPanel> {
                 ],
               ),
             ),
+
           const SizedBox(height: 8),
           widget.isViewMode
               ? FlagsFeature.buildRichText(block.caption ?? "")
@@ -380,34 +383,37 @@ class _InfoboxPanelState extends State<InfoboxPanel> {
       decoration: const BoxDecoration(
         border: Border(top: BorderSide(color: Colors.grey)),
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: [
-          IconButton(
-            icon: const Icon(Icons.image),
-            onPressed: () => _addBlock(InfoboxBlockType.image),
-          ),
-          IconButton(
-            icon: const Icon(Icons.view_column),
-            onPressed: () => _addBlock(InfoboxBlockType.twoColumn),
-          ),
-          IconButton(
-            icon: const Icon(Icons.vertical_split),
-            onPressed: () => _addBlock(InfoboxBlockType.twoColumnSeparated),
-          ),
-          IconButton(
-            icon: const Icon(Icons.format_align_center),
-            onPressed: () => _addBlock(InfoboxBlockType.centeredText),
-          ),
-          IconButton(
-            icon: const Icon(Icons.flag),
-            onPressed: () {
-              if (_activeController != null) {
-                widget.onOpenFlagPicker(_activeController!);
-              }
-            },
-          ),
-        ],
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.start,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.image),
+              onPressed: () => _addBlock(InfoboxBlockType.image),
+            ),
+            IconButton(
+              icon: const Icon(Icons.view_column),
+              onPressed: () => _addBlock(InfoboxBlockType.twoColumn),
+            ),
+            IconButton(
+              icon: const Icon(Icons.vertical_split),
+              onPressed: () => _addBlock(InfoboxBlockType.twoColumnSeparated),
+            ),
+            IconButton(
+              icon: const Icon(Icons.format_align_center),
+              onPressed: () => _addBlock(InfoboxBlockType.centeredText),
+            ),
+            IconButton(
+              icon: const Icon(Icons.flag),
+              onPressed: () {
+                if (_activeController != null) {
+                  widget.onOpenFlagPicker(_activeController!);
+                }
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
