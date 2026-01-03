@@ -1,36 +1,39 @@
-import 'dart:async';
 import 'dart:convert';
-
 import 'package:arted/infobox_panel.dart';
 import 'package:arted/models/articles.dart';
 import 'package:flutter/material.dart';
 import 'package:arted/app_database.dart';
+import 'package:flutter_quill/flutter_quill.dart' as quill;
 
 class WorkspaceController {
   final TextEditingController titleController = TextEditingController();
-  final TextEditingController contentController = TextEditingController();
+  
+  // CHANGED: QuillController instead of TextEditingController
+  late quill.QuillController contentController;
+  
   final List<TocEntry> tocEntries = [];
-
   final List<Article> articles = [];
   final List<String> categories = [];
   final List<Article> openTabs = [];
+  
   Article? selectedArticle;
   bool _infoboxDirty = false;
-
   bool isViewMode = false;
-
-  final List<String> _undoStack = [];
-  final List<String> _redoStack = [];
-  bool _ignoreUndo = false;
-  Timer? _undoDebounce;
 
   String originalContent = "";
   String originalTitle = "";
-  String generateHeadingId() => _generateHeadingId();
+  
   final ValueNotifier<Article?> hoveredArticle = ValueNotifier(null);
   final ValueNotifier<String?> hoveredCategory = ValueNotifier(null);
 
   DateTime? lastSaved;
+
+  WorkspaceController() {
+    // Initialize with empty document
+    contentController = quill.QuillController.basic();
+  }
+
+  String generateHeadingId() => _generateHeadingId();
 
   String _generateHeadingId() {
     return "h_${DateTime.now().microsecondsSinceEpoch}";
@@ -39,61 +42,18 @@ class WorkspaceController {
   void dispose() {
     titleController.dispose();
     contentController.dispose();
+    hoveredArticle.dispose();
+    hoveredCategory.dispose();
   }
 
   void initialize(Function refreshUI, String projectId) {
-    contentController.addListener(_onTextChanged);
+    contentController.addListener(() {
+      rebuildTocFromContent();
+    });
 
     _loadCategories(refreshUI, projectId).then((_) {
       _loadArticles(refreshUI, projectId);
     });
-  }
-
-  Map<String, String>? getCurrentHeadingInfo() {
-    final text = contentController.text;
-    final sel = contentController.selection;
-    if (!sel.isValid) return null;
-
-    final cursor = sel.start;
-    final lineStart = text.lastIndexOf('\n', cursor - 1) + 1;
-    final lineEnd = text.indexOf('\n', cursor);
-    final line = text.substring(
-      lineStart,
-      lineEnd == -1 ? text.length : lineEnd,
-    );
-
-    if (!line.trimLeft().startsWith("## ")) return null;
-
-    final idMatch = RegExp(r'\{#(.*?)\}').firstMatch(line);
-    if (idMatch == null) return null;
-
-    final id = idMatch.group(1)!;
-    final title = line.replaceAll(RegExp(r'##|\{#.*?\}'), '').trim();
-
-    return {"id": id, "title": title};
-  }
-
-  bool get isCursorOnHeading {
-    final text = contentController.text;
-    final sel = contentController.selection;
-
-    if (!sel.isValid) return false;
-    if (sel.start < 0 || sel.start > text.length) return false;
-    if (text.isEmpty) return false;
-
-    final cursor = sel.start;
-
-    final lineStart = text.lastIndexOf('\n', cursor - 1);
-    final start = lineStart == -1 ? 0 : lineStart + 1;
-
-    final lineEnd = text.indexOf('\n', cursor);
-    final end = lineEnd == -1 ? text.length : lineEnd;
-
-    if (start >= end) return false;
-
-    final line = text.substring(start, end);
-
-    return line.startsWith('## ');
   }
 
   void markInfoboxDirty() {
@@ -103,6 +63,140 @@ class WorkspaceController {
   void clearDirtyFlags() {
     _infoboxDirty = false;
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // MARKDOWN TO DELTA CONVERSION
+  // ═══════════════════════════════════════════════════════════
+
+  static List<Map<String, dynamic>> _markdownToDelta(String markdown) {
+    final operations = <Map<String, dynamic>>[];
+    
+    if (markdown.isEmpty) {
+      return operations;
+    }
+
+    final lines = markdown.split('\n');
+    
+    for (int i = 0; i < lines.length; i++) {
+      final line = lines[i];
+      
+      // Handle alignment directives
+      if (line.startsWith('[align:')) {
+        continue; // Skip - we'll implement alignment later if needed
+      }
+      
+      // Handle headings
+      if (line.startsWith('## ')) {
+        final text = _stripHeadingId(line.substring(3).trim());
+        operations.add({'insert': text});
+        operations.add({'insert': '\n', 'attributes': {'header': 2}});
+        continue;
+      }
+      
+      // Handle regular lines with inline formatting
+      if (line.isNotEmpty) {
+        _processInlineFormatting(operations, line);
+      }
+      
+      // Add newline (except for last line if empty)
+      if (i < lines.length - 1 || line.isNotEmpty) {
+        operations.add({'insert': '\n'});
+      }
+    }
+    
+    return operations;
+  }
+
+  static String _stripHeadingId(String text) {
+    // Remove {#id} markers from headings
+    return text.replaceAll(RegExp(r'\{#.*?\}'), '').trim();
+  }
+
+  static void _processInlineFormatting(List<Map<String, dynamic>> operations, String line) {
+    // Regex to match formatting markers
+    final regex = RegExp(
+      r'(\*\*.*?\*\*|__.*?__|~~.*?~~|\^.*?\^|~(?!~).*?~|_.*?_|\[\[.*?\]\]|\[flag:[A-Z0-9]{2,3}\])',
+    );
+
+    int lastIndex = 0;
+
+    for (final match in regex.allMatches(line)) {
+      // Add plain text before match
+      if (match.start > lastIndex) {
+        operations.add({'insert': line.substring(lastIndex, match.start)});
+      }
+
+      final token = match.group(0)!;
+      
+      if (token.startsWith('**')) {
+        final text = token.substring(2, token.length - 2);
+        operations.add({'insert': text, 'attributes': {'bold': true}});
+      } else if (token.startsWith('__')) {
+        final text = token.substring(2, token.length - 2);
+        operations.add({'insert': text, 'attributes': {'underline': true}});
+      } else if (token.startsWith('~~')) {
+        final text = token.substring(2, token.length - 2);
+        operations.add({'insert': text, 'attributes': {'strike': true}});
+      } else if (token.startsWith('^')) {
+        final text = token.substring(1, token.length - 1);
+        operations.add({'insert': text, 'attributes': {'script': 'super'}});
+      } else if (token.startsWith('~') && !token.startsWith('~~')) {
+        final text = token.substring(1, token.length - 1);
+        operations.add({'insert': text, 'attributes': {'script': 'sub'}});
+      } else if (token.startsWith('_') && !token.startsWith('__')) {
+        final text = token.substring(1, token.length - 1);
+        operations.add({'insert': text, 'attributes': {'italic': true}});
+      } else if (token.startsWith('[[')) {
+        final content = token.substring(2, token.length - 2);
+        final parts = content.split('|');
+        final displayText = parts.first;
+        final linkTarget = parts.length > 1 ? parts.last : parts.first;
+        operations.add({'insert': displayText, 'attributes': {'link': linkTarget}});
+      } else if (token.startsWith('[flag:')) {
+        // Preserve flag markers as-is
+        operations.add({'insert': token});
+      }
+
+      lastIndex = match.end;
+    }
+
+    // Add remaining text
+    if (lastIndex < line.length) {
+      operations.add({'insert': line.substring(lastIndex)});
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // DELTA JSON STORAGE
+  // ═══════════════════════════════════════════════════════════
+
+  String _deltaToJson(quill.Document document) {
+    return jsonEncode(document.toDelta().toJson());
+  }
+
+  quill.Document _documentFromJson(String json) {
+    if (json.isEmpty) {
+      return quill.Document();
+    }
+    
+    try {
+      // Try to parse as JSON (new format)
+      final decoded = jsonDecode(json);
+      if (decoded is List) {
+        return quill.Document.fromJson(decoded);
+      }
+    } catch (e) {
+      // Not JSON - treat as markdown
+    }
+    
+    // Fall back to markdown conversion
+    final operations = _markdownToDelta(json);
+    return quill.Document.fromJson(operations);
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // ARTICLE LOADING & SAVING
+  // ═══════════════════════════════════════════════════════════
 
   Future<void> _loadCategories(Function refreshUI, String projectId) async {
     final db = await AppDatabase.database;
@@ -122,44 +216,6 @@ class WorkspaceController {
     }
 
     refreshUI();
-  }
-
-  List<TocEntry> buildTocFromText(String text) {
-    final List<TocEntry> toc = [];
-    final lines = text.split('\n');
-
-    int headingIndex = 0;
-    int charOffset = 0;
-
-    for (final line in lines) {
-      if (line.startsWith('## ')) {
-        final title = line.substring(3).trim();
-        final id = 'h_$headingIndex';
-
-        toc.add(TocEntry(id: id, title: title, textOffset: charOffset));
-
-        headingIndex++;
-      }
-
-      charOffset += line.length + 1;
-    }
-
-    return toc;
-  }
-
-  void _onTextChanged() {
-    if (_ignoreUndo) return;
-
-    rebuildTocFromContent();
-
-    final text = contentController.text;
-    _undoDebounce?.cancel();
-
-    _undoDebounce = Timer(const Duration(milliseconds: 400), () {
-      if (_undoStack.isNotEmpty && _undoStack.last == text) return;
-      _undoStack.add(text);
-      _redoStack.clear();
-    });
   }
 
   Future<void> _loadArticles(Function refreshUI, String projectId) async {
@@ -196,15 +252,27 @@ class WorkspaceController {
         ..add(selectedArticle!);
 
       _loadArticle(selectedArticle!);
-
-      tocEntries
-        ..clear()
-        ..addAll(buildTocFromText(selectedArticle!.content));
-
-      _loadInfoboxBlocks(selectedArticle!);
+      await _loadInfoboxBlocks(selectedArticle!);
     }
 
     refreshUI();
+  }
+
+  void _loadArticle(Article article) {
+    titleController.text = article.title;
+    
+    // Load content as Document
+    final document = _documentFromJson(article.content);
+    contentController = quill.QuillController(
+      document: document,
+      selection: const TextSelection.collapsed(offset: 0),
+    );
+
+    // Rebuild TOC
+    rebuildTocFromContent();
+
+    originalContent = article.content;
+    originalTitle = article.title;
   }
 
   void openArticleByTitle(String title, Function refreshUI) async {
@@ -221,114 +289,6 @@ class WorkspaceController {
     refreshUI();
   }
 
-  void undo() {
-    if (isViewMode || _undoStack.length <= 1) return;
-
-    _undoDebounce?.cancel();
-    _ignoreUndo = true;
-
-    _redoStack.add(_undoStack.removeLast());
-    contentController.text = _undoStack.last;
-
-    _ignoreUndo = false;
-  }
-
-  void redo() {
-    if (isViewMode || _redoStack.isEmpty) return;
-
-    _undoDebounce?.cancel();
-    _ignoreUndo = true;
-
-    final text = _redoStack.removeLast();
-    _undoStack.add(text);
-    contentController.text = text;
-
-    _ignoreUndo = false;
-  }
-
-  bool get hasUnsavedChanges {
-    if (selectedArticle == null) return false;
-
-    return contentController.text != originalContent ||
-        titleController.text != originalTitle ||
-        _infoboxDirty;
-  }
-
-  void _loadArticle(Article article) {
-    _ignoreUndo = true;
-
-    titleController.text = article.title;
-    contentController.text = article.content;
-
-    rebuildTocFromContent();
-
-    originalContent = article.content;
-    originalTitle = article.title;
-
-    _undoStack
-      ..clear()
-      ..add(article.content);
-    _redoStack.clear();
-
-    _ignoreUndo = false;
-  }
-
-  void wrapSelection(String before, String after) {
-    final text = contentController.text;
-    final selection = contentController.selection;
-    if (!selection.isValid || selection.isCollapsed) return;
-
-    _undoDebounce?.cancel();
-    _undoStack.add(text);
-    _redoStack.clear();
-
-    _ignoreUndo = true;
-    final selected = text.substring(selection.start, selection.end);
-    final newText = text.replaceRange(
-      selection.start,
-      selection.end,
-      "$before$selected$after",
-    );
-
-    contentController.text = newText;
-    contentController.selection = TextSelection(
-      baseOffset: selection.start + before.length,
-      extentOffset: selection.start + before.length + selected.length,
-    );
-    _ignoreUndo = false;
-  }
-
-  void insertBlock(String prefix) {
-    final text = contentController.text;
-    final selection = contentController.selection;
-    if (!selection.isValid) return;
-
-    _undoDebounce?.cancel();
-    _undoStack.add(text);
-    _redoStack.clear();
-
-    _ignoreUndo = true;
-
-    final start = selection.start;
-
-    int lineStart;
-    if (start <= 0) {
-      lineStart = 0;
-    } else {
-      final idx = text.lastIndexOf('\n', start - 1);
-      lineStart = idx == -1 ? 0 : idx + 1;
-    }
-
-    final newText = text.replaceRange(lineStart, lineStart, prefix);
-
-    contentController.text = newText;
-    contentController.selection = TextSelection.collapsed(
-      offset: start + prefix.length,
-    );
-
-    _ignoreUndo = false;
-  }
-
   Future<bool> requestArticleSwitch(
     Article target,
     Future<void> Function() onSave,
@@ -342,36 +302,21 @@ class WorkspaceController {
     return false;
   }
 
-  void rebuildTocFromContent() {
-    tocEntries.clear();
+  bool get hasUnsavedChanges {
+    if (selectedArticle == null) return false;
 
-    final text = contentController.text;
-    final lines = text.split('\n');
-
-    int headingIndex = 0;
-    int charOffset = 0;
-
-    for (final line in lines) {
-      if (line.startsWith('## ')) {
-        final title = line.substring(3).trim();
-        if (title.isNotEmpty) {
-          final id = 'h_$headingIndex';
-
-          tocEntries.add(
-            TocEntry(id: id, title: title, textOffset: charOffset),
-          );
-
-          headingIndex++;
-        }
-      }
-
-      charOffset += line.length + 1;
-    }
+    final currentJson = _deltaToJson(contentController.document);
+    
+    return currentJson != originalContent ||
+        titleController.text != originalTitle ||
+        _infoboxDirty;
   }
 
   Future<void> saveArticle(String projectId, Function refreshUI) async {
     final db = await AppDatabase.database;
     final a = selectedArticle!;
+
+    final deltaJson = _deltaToJson(contentController.document);
 
     final exists = await db.query(
       'articles',
@@ -382,7 +327,7 @@ class WorkspaceController {
     final data = {
       'project_id': projectId,
       'title': titleController.text.trim(),
-      'content': contentController.text,
+      'content': deltaJson,
       'category': a.category,
     };
 
@@ -406,15 +351,48 @@ class WorkspaceController {
     );
 
     a.title = titleController.text.trim();
-    a.content = contentController.text;
+    a.content = deltaJson;
 
     lastSaved = DateTime.now();
     refreshUI();
 
     _infoboxDirty = false;
-    originalContent = contentController.text;
+    originalContent = deltaJson;
     originalTitle = titleController.text;
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // TABLE OF CONTENTS
+  // ═══════════════════════════════════════════════════════════
+
+  void rebuildTocFromContent() {
+    tocEntries.clear();
+    
+    final doc = contentController.document;
+    int headingIndex = 0;
+    int charOffset = 0;
+
+    for (final node in doc.root.children) {
+      final style = node.style.attributes['header'];
+      
+      if (style != null && style.value == 2) {
+        final text = node.toPlainText().trim();
+        if (text.isNotEmpty) {
+          final id = 'h_$headingIndex';
+          tocEntries.add(
+            TocEntry(id: id, title: text, textOffset: charOffset),
+          );
+          headingIndex++;
+        }
+      }
+      
+      charOffset += node.length;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // INFOBOX BLOCKS
+  // ═══════════════════════════════════════════════════════════
 
   Future<void> _loadInfoboxBlocks(Article article) async {
     final db = await AppDatabase.database;

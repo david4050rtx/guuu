@@ -1,0 +1,123 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_quill/flutter_quill.dart' as quill;
+
+class QuillToolbarWrapper extends StatefulWidget {
+  final quill.QuillController controller;
+  final Color panelColor;
+  final VoidCallback onOpenFlagMenu;
+  final VoidCallback onLink;
+
+  const QuillToolbarWrapper({
+    super.key,
+    required this.controller,
+    required this.panelColor,
+    required this.onOpenFlagMenu,
+    required this.onLink,
+  });
+
+  @override
+  State<QuillToolbarWrapper> createState() => _QuillToolbarWrapperState();
+}
+
+class _QuillToolbarWrapperState extends State<QuillToolbarWrapper> {
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onSelectionChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onSelectionChanged);
+    super.dispose();
+  }
+
+  void _onSelectionChanged() {
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      decoration: BoxDecoration(
+        color: widget.panelColor,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Wrap(
+        spacing: 4,
+        runSpacing: 4,
+        children: [
+          _toggleFormatButton(Icons.format_bold, 'Bold', quill.Attribute.bold),
+          _toggleFormatButton(Icons.format_italic, 'Italic', quill.Attribute.italic),
+          _toggleFormatButton(Icons.format_underlined, 'Underline', quill.Attribute.underline),
+          _toggleFormatButton(Icons.format_strikethrough, 'Strikethrough', quill.Attribute.strikeThrough),
+          const SizedBox(width: 8, height: 32, child: VerticalDivider(color: Colors.grey)),
+          _formatButton(Icons.title, 'Heading', quill.Attribute.h2),
+          const SizedBox(width: 8, height: 32, child: VerticalDivider(color: Colors.grey)),
+          _customButton(Icons.link, 'Link', widget.onLink),
+          _customButton(Icons.flag, 'Flag', widget.onOpenFlagMenu),
+        ],
+      ),
+    );
+  }
+
+  Widget _toggleFormatButton(IconData icon, String tooltip, quill.Attribute attribute) {
+    final isActive = _isAttributeActive(attribute);
+    
+    return IconButton(
+      icon: Icon(
+        icon,
+        size: 18,
+        color: isActive ? Colors.blue : Colors.white,
+      ),
+      tooltip: tooltip,
+      onPressed: () {
+        final selection = widget.controller.selection;
+        if (selection.isCollapsed) return;
+        
+        // Toggle: if active, remove it; if not, apply it
+        if (isActive) {
+          widget.controller.formatSelection(quill.Attribute.clone(attribute, null));
+        } else {
+          widget.controller.formatSelection(attribute);
+        }
+      },
+      padding: const EdgeInsets.all(4),
+      constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+    );
+  }
+
+  bool _isAttributeActive(quill.Attribute attribute) {
+    final selection = widget.controller.selection;
+    if (selection.isCollapsed) return false;
+    
+    final styles = widget.controller.getSelectionStyle();
+    
+    // Check if the attribute exists and is not null
+    return styles.attributes.containsKey(attribute.key) &&
+           styles.attributes[attribute.key]?.value != null;
+  }
+
+  Widget _formatButton(IconData icon, String tooltip, quill.Attribute attribute) {
+    return IconButton(
+      icon: Icon(icon, size: 18, color: Colors.white),
+      tooltip: tooltip,
+      onPressed: () {
+        widget.controller.formatSelection(attribute);
+      },
+      padding: const EdgeInsets.all(4),
+      constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+    );
+  }
+
+  Widget _customButton(IconData icon, String tooltip, VoidCallback onPressed) {
+    return IconButton(
+      icon: Icon(icon, size: 18, color: Colors.white),
+      tooltip: tooltip,
+      onPressed: onPressed,
+      padding: const EdgeInsets.all(4),
+      constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+    );
+  }
+}
